@@ -21,7 +21,6 @@ jobs:
       - name: Create all the mod files
         run: |
           mkdir -p src/main/java/com/example/chunkcapture
-          mkdir -p src/main/java/com/example/chunkcapture/mixin
           mkdir -p src/main/resources/assets/chunkcapture/lang
 
           cat > settings.gradle << 'EOF'
@@ -40,7 +39,7 @@ jobs:
           yarn_mappings=1.21.11+build.3
           loader_version=0.18.1
           fabric_version=0.141.6+1.21.11
-          mod_version=1.0.0
+          mod_version=2.0.0
           maven_group=com.example.chunkcapture
           archives_base_name=chunkcapture
           EOF
@@ -92,7 +91,7 @@ jobs:
             "id": "chunkcapture",
             "version": "${version}",
             "name": "Chunk Capture",
-            "description": "Stops chunks from being thrown away, so a world downloader can save everything that was ever loaded.",
+            "description": "Copies every chunk that loads during a replay into a saved world, so nothing is lost when the replay moves on.",
             "environment": "client",
             "license": "CC0-1.0",
             "entrypoints": {
@@ -100,9 +99,6 @@ jobs:
                 "com.example.chunkcapture.ChunkCapture"
               ]
             },
-            "mixins": [
-              "chunkcapture.mixins.json"
-            ],
             "depends": {
               "fabricloader": ">=0.18.0",
               "minecraft": "~1.21.11",
@@ -118,27 +114,19 @@ jobs:
           }
           EOF
 
-          cat > src/main/resources/chunkcapture.mixins.json << 'EOF'
-          {
-            "required": true,
-            "package": "com.example.chunkcapture.mixin",
-            "compatibilityLevel": "JAVA_21",
-            "client": [
-              "ChunkUnloadMixin"
-            ],
-            "injectors": {
-              "defaultRequire": 1
-            }
-          }
-          EOF
-
           cat > src/main/java/com/example/chunkcapture/CaptureState.java << 'EOF'
           package com.example.chunkcapture;
 
-          // One on/off switch, shared by the keybind and the mixin.
+          import java.util.HashSet;
+          import java.util.Set;
+          import net.minecraft.util.math.ChunkPos;
+
+          // The on/off switch, plus the list of chunks already written so the
+          // same chunk is not saved over and over as the replay plays.
           public class CaptureState {
 
               private static boolean capturing = false;
+              private static final Set<ChunkPos> saved = new HashSet<>();
 
               public static boolean isCapturing() {
                   return capturing;
@@ -148,8 +136,179 @@ jobs:
                   capturing = !capturing;
               }
 
-              public static void setCapturing(boolean value) {
-                  capturing = value;
+              public static boolean alreadySaved(ChunkPos pos) {
+                  return saved.contains(pos);
+              }
+
+              public static void markSaved(ChunkPos pos) {
+                  saved.add(pos);
+              }
+
+              public static int savedCount() {
+                  return saved.size();
+              }
+
+              public static void clear() {
+                  saved.clear();
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/chunkcapture/ChunkWriter.java << 'EOF'
+          package com.example.chunkcapture;
+
+          import java.io.DataOutputStream;
+          import java.io.IOException;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import net.minecraft.SharedConstants;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.nbt.NbtCompound;
+          import net.minecraft.nbt.NbtIo;
+          import net.minecraft.nbt.NbtList;
+          import net.minecraft.util.math.ChunkPos;
+          import net.minecraft.world.chunk.WorldChunk;
+
+          // Writes each captured chunk out as its own small NBT file under
+          // .minecraft/chunkcapture/<name>/. A separate step turns the pile
+          // into a real world; keeping them as plain files first means a
+          // crash halfway through never loses what was already captured.
+          public class ChunkWriter {
+
+              private static Path folder = null;
+
+              public static Path folder() {
+                  if (folder == null) {
+                      Path base = MinecraftClient.getInstance().runDirectory
+                              .toPath().resolve("chunkcapture");
+                      folder = base.resolve("capture-" + System.currentTimeMillis());
+                      try {
+                          Files.createDirectories(folder);
+                      } catch (IOException e) {
+                          e.printStackTrace();
+                      }
+                  }
+                  return folder;
+              }
+
+              public static void reset() {
+                  folder = null;
+              }
+
+              public static void write(WorldChunk chunk) {
+                  ChunkPos pos = chunk.getPos();
+
+                  NbtCompound root = new NbtCompound();
+                  root.putInt("DataVersion", SharedConstants.getGameVersion().dataVersion().id());
+                  root.putInt("xPos", pos.x);
+                  root.putInt("zPos", pos.z);
+                  root.putInt("yPos", chunk.getBottomY() >> 4);
+                  root.putString("Status", "minecraft:full");
+
+                  NbtList sections = new NbtList();
+                  var codec = net.minecraft.world.chunk.ChunkSection.CODEC;
+
+                  for (int i = 0; i < chunk.getSectionArray().length; i++) {
+                      var section = chunk.getSectionArray()[i];
+                      NbtCompound sectionTag = new NbtCompound();
+                      sectionTag.putByte("Y", (byte) (chunk.sectionIndexToCoord(i)));
+
+                      NbtCompound blocks = BlockPaletteWriter.write(section);
+                      if (blocks != null) {
+                          sectionTag.put("block_states", blocks);
+                      }
+                      sections.add(sectionTag);
+                  }
+                  root.put("sections", sections);
+
+                  Path file = folder().resolve("c." + pos.x + "." + pos.z + ".nbt");
+                  try (DataOutputStream out = new DataOutputStream(
+                          Files.newOutputStream(file))) {
+                      NbtIo.writeCompressed(root, out);
+                  } catch (IOException e) {
+                      e.printStackTrace();
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/chunkcapture/BlockPaletteWriter.java << 'EOF'
+          package com.example.chunkcapture;
+
+          import net.minecraft.block.BlockState;
+          import net.minecraft.nbt.NbtCompound;
+          import net.minecraft.nbt.NbtList;
+          import net.minecraft.nbt.NbtString;
+          import net.minecraft.registry.Registries;
+          import net.minecraft.world.chunk.ChunkSection;
+
+          // Turns one 16x16x16 slice of a chunk into the palette + index
+          // layout that Minecraft world files use.
+          public class BlockPaletteWriter {
+
+              public static NbtCompound write(ChunkSection section) {
+                  if (section == null) return null;
+
+                  java.util.List<BlockState> palette = new java.util.ArrayList<>();
+                  java.util.Map<BlockState, Integer> lookup = new java.util.HashMap<>();
+                  long[] indices = new long[4096];
+
+                  int at = 0;
+                  for (int y = 0; y < 16; y++) {
+                      for (int z = 0; z < 16; z++) {
+                          for (int x = 0; x < 16; x++) {
+                              BlockState state = section.getBlockState(x, y, z);
+                              Integer id = lookup.get(state);
+                              if (id == null) {
+                                  id = palette.size();
+                                  palette.add(state);
+                                  lookup.put(state, id);
+                              }
+                              indices[at++] = id;
+                          }
+                      }
+                  }
+
+                  NbtList paletteTag = new NbtList();
+                  for (BlockState state : palette) {
+                      NbtCompound entry = new NbtCompound();
+                      entry.putString("Name",
+                              Registries.BLOCK.getId(state.getBlock()).toString());
+
+                      if (!state.getProperties().isEmpty()) {
+                          NbtCompound props = new NbtCompound();
+                          for (var property : state.getProperties()) {
+                              props.put(property.getName(),
+                                      NbtString.of(name(state, property)));
+                          }
+                          entry.put("Properties", props);
+                      }
+                      paletteTag.add(entry);
+                  }
+
+                  NbtCompound blocks = new NbtCompound();
+                  blocks.put("palette", paletteTag);
+
+                  if (palette.size() > 1) {
+                      int bits = Math.max(4, 32 - Integer.numberOfLeadingZeros(palette.size() - 1));
+                      int perLong = 64 / bits;
+                      long[] packed = new long[(4096 + perLong - 1) / perLong];
+
+                      for (int i = 0; i < 4096; i++) {
+                          int slot = i / perLong;
+                          int offset = (i % perLong) * bits;
+                          packed[slot] |= (indices[i] & ((1L << bits) - 1)) << offset;
+                      }
+                      blocks.putLongArray("data", packed);
+                  }
+
+                  return blocks;
+              }
+
+              @SuppressWarnings({ "unchecked", "rawtypes" })
+              private static String name(BlockState state,
+                                         net.minecraft.state.property.Property property) {
+                  return property.name(state.get(property));
               }
           }
           EOF
@@ -158,6 +317,7 @@ jobs:
           package com.example.chunkcapture;
 
           import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientChunkEvents;
           import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
           import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
           import net.minecraft.client.MinecraftClient;
@@ -166,10 +326,13 @@ jobs:
           import net.minecraft.text.Text;
           import org.lwjgl.glfw.GLFW;
 
-          // K turns capture on and off, and tells you in chat which it is.
+          // K starts and stops capture. While it is on, every chunk that
+          // loads gets written out straight away, so chunks that later
+          // disappear are already safely on disk.
           public class ChunkCapture implements ClientModInitializer {
 
               private static KeyBinding toggleKey;
+              private static int announceTimer = 0;
 
               @Override
               public void onInitializeClient() {
@@ -180,12 +343,35 @@ jobs:
                           KeyBinding.Category.MISC
                   ));
 
+                  ClientChunkEvents.CHUNK_LOAD.register((world, chunk) -> {
+                      if (!CaptureState.isCapturing()) return;
+                      if (CaptureState.alreadySaved(chunk.getPos())) return;
+
+                      CaptureState.markSaved(chunk.getPos());
+                      ChunkWriter.write(chunk);
+                  });
+
                   ClientTickEvents.END_CLIENT_TICK.register(client -> {
                       while (toggleKey.wasPressed()) {
                           CaptureState.toggle();
-                          tell(client, CaptureState.isCapturing()
-                                  ? "Chunk Capture ON - chunks will be kept"
-                                  : "Chunk Capture OFF");
+
+                          if (CaptureState.isCapturing()) {
+                              CaptureState.clear();
+                              ChunkWriter.reset();
+                              tell(client, "Chunk Capture ON - saving to "
+                                      + ChunkWriter.folder().getFileName());
+                          } else {
+                              tell(client, "Chunk Capture OFF - "
+                                      + CaptureState.savedCount() + " chunks saved");
+                          }
+                      }
+
+                      if (CaptureState.isCapturing()) {
+                          announceTimer++;
+                          if (announceTimer >= 200) {
+                              announceTimer = 0;
+                              tell(client, CaptureState.savedCount() + " chunks captured");
+                          }
                       }
                   });
               }
@@ -193,32 +379,6 @@ jobs:
               private static void tell(MinecraftClient client, String message) {
                   if (client.player != null) {
                       client.player.sendMessage(Text.literal(message), false);
-                  }
-              }
-          }
-          EOF
-
-          cat > src/main/java/com/example/chunkcapture/mixin/ChunkUnloadMixin.java << 'EOF'
-          package com.example.chunkcapture.mixin;
-
-          import com.example.chunkcapture.CaptureState;
-          import net.minecraft.client.network.ClientPlayNetworkHandler;
-          import net.minecraft.network.packet.s2c.play.UnloadChunkS2CPacket;
-          import org.spongepowered.asm.mixin.Mixin;
-          import org.spongepowered.asm.mixin.injection.At;
-          import org.spongepowered.asm.mixin.injection.Inject;
-          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-
-          // While capture is on, ignore every "throw this chunk away" message.
-          // Chunks then pile up instead of vanishing, so a world downloader
-          // can save all of them.
-          @Mixin(ClientPlayNetworkHandler.class)
-          public class ChunkUnloadMixin {
-
-              @Inject(method = "onUnloadChunk", at = @At("HEAD"), cancellable = true)
-              private void chunkcapture$keepChunk(UnloadChunkS2CPacket packet, CallbackInfo ci) {
-                  if (CaptureState.isCapturing()) {
-                      ci.cancel();
                   }
               }
           }

@@ -39,7 +39,7 @@ jobs:
           yarn_mappings=1.21.11+build.3
           loader_version=0.18.1
           fabric_version=0.141.6+1.21.11
-          mod_version=2.0.0
+          mod_version=2.0.1
           maven_group=com.example.chunkcapture
           archives_base_name=chunkcapture
           EOF
@@ -206,7 +206,6 @@ jobs:
                   root.putString("Status", "minecraft:full");
 
                   NbtList sections = new NbtList();
-                  var codec = net.minecraft.world.chunk.ChunkSection.CODEC;
 
                   for (int i = 0; i < chunk.getSectionArray().length; i++) {
                       var section = chunk.getSectionArray()[i];
